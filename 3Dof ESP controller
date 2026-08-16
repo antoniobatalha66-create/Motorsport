@@ -1,0 +1,138 @@
+clear; clc; close all;
+
+%% Parámetros reales del carcross
+m  = 425;           % masa [kg]
+Iz = 543.603;       % inercia de guiñada [kg·m²]
+a  = 1.23;          % distancia CG - eje delantero [m]
+b  = 0.82;          % distancia CG - eje trasero [m]
+Cf = 58281.8;       % rigidez lateral delantera [N/rad]
+Cr = 65787.4;       % rigidez lateral trasera [N/rad]
+
+%% Velocidad de diseño (para calcular r_ref) vs velocidad real
+Ux_ref = 20;        % m/s — velocidad para la que se calcula la referencia
+Ux_sim = 30;        % m/s — velocidad real de simulación (entra más rápido)
+
+%% Referencia calculada a Ux_ref
+L         = a + b;
+G_ref     = Ux_ref / ( L*(1 + (m*Ux_ref^2*(Cr*b - Cf*a))/(Cf*Cr*L^2)) );
+delta_val = 15*pi/180;
+r_ref_val = G_ref * delta_val;
+
+fprintf('=== REFERENCIA ===\n')
+fprintf('Ux diseño  = %.1f m/s\n', Ux_ref)
+fprintf('Ux real    = %.1f m/s\n', Ux_sim)
+fprintf('r_ref      = %.4f rad/s\n', r_ref_val)
+
+%% Matrices a Ux_sim (velocidad real)
+A = [ -(Cf+Cr)/(m*Ux_sim),        (-a*Cf + b*Cr)/(m*Ux_sim) - Ux_sim;
+      (-a*Cf + b*Cr)/(Iz*Ux_sim), -(a^2*Cf + b^2*Cr)/(Iz*Ux_sim)     ];
+B = [ Cf/m;
+      a*Cf/Iz ];
+E = [0; 1/Iz];
+
+%% Régimen permanente real (a Ux_sim)
+x_ss_real = -A \ (B * delta_val);
+fprintf('r_ss real (a %.0f m/s) = %.4f rad/s\n', Ux_sim, x_ss_real(2))
+fprintf('Error permanente sin control = %.4f rad/s\n', x_ss_real(2) - r_ref_val)
+
+%% Sistema aumentado con integrador
+C_r   = [0, 1];
+A_aug = [A,   zeros(2,1);
+         C_r, 0         ];
+E_aug = [E; 0];
+
+Q_aug = diag([0,1, 5000, 2000]);%%Q_aug = diag([peso_vy, peso_r, peso_integral]);
+R = 0.002;
+K_aug = lqr(A_aug, E_aug, Q_aug, R);
+K_vy  = K_aug(1);
+K_r   = K_aug(2);
+K_i   = K_aug(3);
+
+fprintf('\nGanancias LQR:\n')
+fprintf('K_vy=%.4f  K_r=%.4f  K_i=%.4f\n', K_vy, K_r, K_i)
+
+ev_cl = eig(A_aug - E_aug*K_aug);
+fprintf('Autovalores lazo cerrado: %.4f  %.4f  %.4f\n', ...
+        ev_cl(1), ev_cl(2), ev_cl(3))
+
+%% Simulación
+dt     = 0.005;
+t      = 0:dt:2;
+N      = length(t);
+Mz_max = 1350;
+
+%% Sin control — parte de cero, evoluciona a r_ss_real ≠ r_ref
+x_nc      = zeros(2,N);
+for k = 1:N-1
+    xdot        = A*x_nc(:,k) + B*delta_val;
+    x_nc(:,k+1) = x_nc(:,k) + dt*xdot;
+end
+vy = x_nc(1,:)';
+r  = x_nc(2,:)';
+
+%% Con control LQR+I — fuerza r → r_ref aunque r_ss_real ≠ r_ref
+x_cl = zeros(2,N);
+xi   = zeros(1,N);
+Mz   = zeros(1,N);
+
+for k = 1:N-1
+    e_r  = x_cl(2,k) - r_ref_val;
+    e_vy = x_cl(1,k);
+
+    u_Mz = -K_vy*e_vy - K_r*e_r - K_i*xi(k);
+    u_Mz = max(-Mz_max, min(Mz_max, u_Mz));
+
+    xdot        = A*x_cl(:,k) + B*delta_val + E*u_Mz;
+    xi(k+1)     = xi(k) + dt*e_r;
+    x_cl(:,k+1) = x_cl(:,k) + dt*xdot;
+    Mz(k)       = u_Mz;
+end
+Mz(N) = max(-Mz_max, min(Mz_max, ...
+        -K_vy*x_cl(1,N) - K_r*(x_cl(2,N)-r_ref_val) - K_i*xi(N)));
+
+vy_cl = x_cl(1,:)';
+r_cl  = x_cl(2,:)';
+r_ref = r_ref_val * ones(N,1);
+
+%%fprintf('\nMz maximo: %.1f Nm\n', max(abs(Mz)))
+fprintf('Error permanente SIN control: %.5f rad/s\n', r(end)    - r_ref_val)
+fprintf('Error permanente CON control: %.5f rad/s\n', r_cl(end) - r_ref_val)
+
+%% Tiempo de establecimiento con control (banda ±5%)
+banda  = 0.05 * r_ref_val;
+r_err  = abs(r_cl - r_ref_val);
+idx_cl = find(r_err > banda, 1, 'last');
+if ~isempty(idx_cl)
+    fprintf('Tiempo establecimiento CON control (5%%): %.3f s\n', t(idx_cl))
+end
+
+%% Gráficas
+figure;
+subplot(2,1,1)
+plot(t, vy,    'b', 'LineWidth', 1.5); hold on
+plot(t, vy_cl, 'g', 'LineWidth', 1.5)
+yline(0,'k--','LineWidth',1)
+ylabel('v_y [m/s]')
+legend('Sin control','Con control LQR+I')
+grid on
+title('Velocidad lateral')
+
+subplot(2,1,2)
+plot(t, r,     'b',   'LineWidth', 1.5); hold on
+plot(t, r_cl,  'g',   'LineWidth', 1.5)
+plot(t, r_ref, 'r--', 'LineWidth', 1.5)
+yline(r_ref_val*1.05, 'k:', 'LineWidth', 1)
+yline(r_ref_val*0.95, 'k:', 'LineWidth', 1)
+ylabel('r [rad/s]'); xlabel('Tiempo [s]')
+legend('Sin control','Con control LQR+I','Referencia','Banda ±5%')
+grid on
+title(sprintf('Yaw rate — Ux diseño %.0f m/s vs Ux real %.0f m/s', Ux_ref, Ux_sim))
+
+figure;
+plot(t, Mz, 'k', 'LineWidth', 1.5); hold on
+yline( Mz_max, 'r--', 'LineWidth', 1.5)
+yline(-Mz_max, 'r--', 'LineWidth', 1.5)
+xlabel('Tiempo [s]'); ylabel('M_z [Nm]')
+legend('Mz aplicado','Límite físico')
+title('Momento de control (LQR+I)')
+grid on
