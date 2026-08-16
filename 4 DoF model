@@ -1,0 +1,287 @@
+clear; clc; close all;
+
+%% =========================================================
+%% PARÁMETROS DEL VEHÍCULO — CARCROSS
+%% =========================================================
+m  = 425;           % masa [kg]
+Iz = 543.603;       % inercia de guiñada [kg·m²]
+a  = 1.23;          % distancia CG - eje delantero [m]
+b  = 0.82;          % distancia CG - eje trasero [m]
+Cf = 58281.8;       % rigidez lateral delantera [N/rad]
+Cr = 65787.4;       % rigidez lateral trasera [N/rad]
+L  = a + b;         % batalla [m]
+
+%% Parámetros de tracción/resistencia
+Fx_motor  = 1200;   % fuerza de tracción constante [N]
+Cx        = 80;     % coeficiente de resistencia longitudinal [N·s/m]
+                    % (resistencia al rodado + aerodinámica simplificada)
+
+%% Límite del actuador ESP
+Mz_max = 1350;      % [Nm]
+
+%% =========================================================
+%% CONDICIONES INICIALES
+%% Sobreviraje de entrada: el coche llega a la curva con
+%% yaw rate excesivo respecto a la referencia
+%% =========================================================
+Ux0 = 20;           % velocidad longitudinal inicial [m/s]
+vy0 =  0.0;         % velocidad lateral inicial [m/s] — derrape trasero
+r0  =  0.0;         % yaw rate inicial [rad/s] — sobreviraje
+
+%% =========================================================
+%% REFERENCIA DE YAW RATE
+%% Calculada para Ux0 y delta constante
+%% =========================================================
+delta_val = -15*pi/180;    % ángulo de volante [rad]
+G_ref     = Ux0 / ( L*(1 + (m*Ux0^2*(Cr*b - Cf*a))/(Cf*Cr*L^2)) );
+r_ref_val = G_ref * delta_val;
+
+fprintf('=== REFERENCIA ===\n')
+fprintf('delta   = %.2f deg\n', delta_val*180/pi)
+fprintf('r_ref   = %.4f rad/s\n', r_ref_val)
+fprintf('\n=== CONDICIÓN INICIAL ===\n')
+fprintf('Ux0     = 30 m/s\n', Ux0)
+fprintf('vy0     = %.2f m/s\n', vy0)
+fprintf('r0      = %.4f rad/s\n', r0)
+fprintf('r0 - r_ref = %.4f rad/s (sobreviraje)\n', r0 - r_ref_val)
+
+%% =========================================================
+%% DISEÑO DEL CONTROLADOR LQR+I
+%% Se diseña sobre el modelo bicíclico linealizado en Ux0
+%% El modelo no lineal de 3GDL se usa solo en simulación
+%% =========================================================
+A_lin = [ -(Cf+Cr)/(m*Ux0),        (-a*Cf + b*Cr)/(m*Ux0) - Ux0;
+          (-a*Cf + b*Cr)/(Iz*Ux0), -(a^2*Cf + b^2*Cr)/(Iz*Ux0)  ];
+E_lin = [0; 1/Iz];
+
+%% Sistema aumentado [vy, r, xi] donde xi = integral(r - r_ref)
+A_aug = [A_lin,      zeros(2,1);
+         0,  1,      0         ];
+E_aug = [E_lin; 0];
+
+Q_aug = diag([010, 50000, 7000000]);
+R_lqr = 0.000025;
+K_aug = lqr(A_aug, E_aug, Q_aug, R_lqr);
+K_vy  = K_aug(1);
+K_r   = K_aug(2);
+K_i   = K_aug(3);
+
+fprintf('\n=== GANANCIAS LQR ===\n')
+fprintf('K_vy = %.4f\n', K_vy)
+fprintf('K_r  = %.4f\n', K_r)
+fprintf('K_i  = %.4f\n', K_i)
+
+ev_cl = eig(A_aug - E_aug*K_aug);
+fprintf('Autovalores lazo cerrado: %.4f  %.4f  %.4f\n', ...
+        ev_cl(1), ev_cl(2), ev_cl(3))
+
+%% =========================================================
+%% SIMULACIÓN — MODELO NO LINEAL DE 3 GDL
+%%
+%% Estados: x = [Ux, vy, r]
+%%
+%% dUx/dt = (Fx - Cx·Ux)/m + vy·r          (Newton long.)
+%% dvy/dt = (Fy_f + Fy_r)/m - Ux·r         (Newton lat.)
+%% dr/dt  = (a·Fy_f - b·Fy_r + Mz)/Iz      (Euler rot.)
+%%
+%% Ángulos de deriva:
+%% alpha_f = delta - (vy + a·r)/Ux
+%% alpha_r =       - (vy - b·r)/Ux
+%%
+%% Fuerzas laterales (lineal):
+%% Fy_f = Cf · alpha_f
+%% Fy_r = Cr · alpha_r
+%% =========================================================
+dt = 0.005;
+t  = 0:dt:2;
+N  = length(t);
+
+%% --- Sin control ---
+X_nc      = zeros(3,N);    % [Ux; vy; r]
+X_nc(:,1) = [Ux0; vy0; r0];
+
+for k = 1:N-1
+    Ux = X_nc(1,k);
+    vy = X_nc(2,k);
+    r  = X_nc(3,k);
+
+    % Ángulos de deriva
+    alpha_f = delta_val - (vy + a*r)/Ux;
+    alpha_r =           - (vy - b*r)/Ux;
+
+    % Fuerzas laterales
+    Fy_f = Cf * alpha_f;
+    Fy_r = Cr * alpha_r;
+
+    % Ecuaciones de movimiento sin control
+    dUx = (Fx_motor - Cx*Ux)/m + vy*r;
+    dvy = (Fy_f + Fy_r)/m      - Ux*r;
+    dr  = (a*Fy_f - b*Fy_r)/Iz;
+
+    X_nc(:,k+1) = X_nc(:,k) + dt*[dUx; dvy; dr];
+end
+
+%% --- Con control LQR+I ---
+X_cl      = zeros(3,N);
+X_cl(:,1) = [Ux0; vy0; r0];
+xi        = zeros(1,N);
+Mz        = zeros(1,N);
+
+for k = 1:N-1
+    Ux = X_cl(1,k);
+    vy = X_cl(2,k);
+    r  = X_cl(3,k);
+
+    % Ángulos de deriva
+    alpha_f = delta_val - (vy + a*r)/Ux;
+    alpha_r =           - (vy - b*r)/Ux;
+
+    % Fuerzas laterales
+    Fy_f = Cf * alpha_f;
+    Fy_r = Cr * alpha_r;
+
+    % Error de yaw rate y ley de control
+    e_r  = r  - r_ref_val;
+    e_vy = vy;                  % vy debe tender a cero
+
+    u_Mz = -K_vy*e_vy - K_r*e_r - K_i*xi(k);
+    u_Mz = max(-Mz_max, min(Mz_max, u_Mz));
+
+    % Ecuaciones de movimiento con control
+    dUx = (Fx_motor - Cx*Ux)/m + vy*r;
+    dvy = (Fy_f + Fy_r)/m      - Ux*r;
+    dr  = (a*Fy_f - b*Fy_r + u_Mz)/Iz;
+
+    xi(k+1)     = xi(k) + dt*e_r;
+    X_cl(:,k+1) = X_cl(:,k) + dt*[dUx; dvy; dr];
+    Mz(k)       = u_Mz;
+end
+Mz(N) = max(-Mz_max, min(Mz_max, ...
+        -K_vy*X_cl(2,N) - K_r*(X_cl(3,N)-r_ref_val) - K_i*xi(N)));
+
+%% Extraer estados
+Ux_nc = X_nc(1,:)';  vy_nc = X_nc(2,:)';  r_nc = X_nc(3,:)';
+Ux_cl = X_cl(1,:)';  vy_cl = X_cl(2,:)';  r_cl = X_cl(3,:)';
+r_ref = r_ref_val * ones(N,1);
+
+%% =========================================================
+%% RESULTADOS
+%% =========================================================
+fprintf('\n=== RESULTADOS ===\n')
+fprintf('Mz maximo aplicado:          %.1f Nm\n',  max(abs(Mz)))
+fprintf('Error final r SIN control:   %.5f rad/s\n', r_nc(end) - r_ref_val)
+fprintf('Error final r CON control:   %.5f rad/s\n', r_cl(end) - r_ref_val)
+fprintf('Ux final SIN control:        %.3f m/s\n',  Ux_nc(end))
+fprintf('Ux final CON control:        %.3f m/s\n',  Ux_cl(end))
+
+banda  = 0.05 * r_ref_val;
+idx_nc = find(abs(r_nc - r_ref_val) > banda, 1, 'last');
+idx_cl = find(abs(r_cl - r_ref_val) > banda, 1, 'last');
+if ~isempty(idx_nc)
+    fprintf('Tiempo establ. SIN control (5%%): %.3f s\n', t(idx_nc))
+end
+if ~isempty(idx_cl)
+    fprintf('Tiempo establ. CON control (5%%): %.3f s\n', t(idx_cl))
+end
+
+%% =========================================================
+%% GRÁFICAS
+%% =========================================================
+figure('Name','Modelo 3GDL — Cuadriciclo con ESP');
+
+%% Velocidad longitudinal
+subplot(3,1,1)
+plot(t, Ux_nc, 'b', 'LineWidth', 1.5); hold on
+plot(t, Ux_cl, 'g', 'LineWidth', 1.5)
+ylabel('U_x [m/s]')
+legend('Sin control','Con control LQR+I')
+grid on
+title('Velocidad longitudinal')
+
+%% Velocidad lateral
+subplot(3,1,2)
+plot(t, vy_nc, 'b', 'LineWidth', 1.5); hold on
+plot(t, vy_cl, 'g', 'LineWidth', 1.5)
+yline(0,'k--','LineWidth',1)
+ylabel('v_y [m/s]')
+legend('Sin control','Con control LQR+I')
+grid on
+title('Velocidad lateral')
+
+%% Yaw rate
+subplot(3,1,3)
+plot(t, r_nc,  'b',   'LineWidth', 1.5); hold on
+plot(t, r_cl,  'g',   'LineWidth', 1.5)
+plot(t, r_ref, 'r--', 'LineWidth', 1.5)
+yline(r_ref_val*1.05, 'k:', 'LineWidth', 1)
+yline(r_ref_val*0.95, 'k:', 'LineWidth', 1)
+ylabel('r [rad/s]')
+xlabel('Tiempo [s]')
+legend('Sin control','Con control LQR+I','Referencia','Banda ±5%')
+grid on
+title('Yaw rate — Recuperación de sobreviraje')
+
+%% Momento de control
+figure('Name','Momento de control ESP');
+plot(t, Mz, 'k', 'LineWidth', 1.5); hold on
+yline( Mz_max, 'r--', 'LineWidth', 1.5)
+yline(-Mz_max, 'r--', 'LineWidth', 1.5)
+xlabel('Tiempo [s]')
+ylabel('M_z [Nm]')
+legend('Mz aplicado','Límite físico ±1350 Nm')
+title('Momento de control generado por el ESP')
+grid on
+
+%% Ángulos de deriva
+figure('Name','Ángulos de deriva');
+alpha_f_nc = delta_val - (vy_nc + a*r_nc)./Ux_nc;
+alpha_r_nc =           - (vy_nc - b*r_nc)./Ux_nc;
+alpha_f_cl = delta_val - (vy_cl + a*r_cl)./Ux_cl;
+alpha_r_cl =           - (vy_cl - b*r_cl)./Ux_cl;
+
+subplot(2,1,1)
+plot(t, alpha_f_nc*180/pi, 'b', 'LineWidth', 1.5); hold on
+plot(t, alpha_f_cl*180/pi, 'g', 'LineWidth', 1.5)
+ylabel('\alpha_f [deg]')
+legend('Sin control','Con control')
+grid on; title('Ángulo de deriva delantero')
+
+subplot(2,1,2)
+plot(t, alpha_r_nc*180/pi, 'b', 'LineWidth', 1.5); hold on
+plot(t, alpha_r_cl*180/pi, 'g', 'LineWidth', 1.5)
+ylabel('\alpha_r [deg]')
+xlabel('Tiempo [s]')
+legend('Sin control','Con control')
+grid on; title('Ángulo de deriva trasero')
+
+%% Velocidad absoluta
+V_abs_nc = sqrt(Ux_nc.^2 + vy_nc.^2);
+V_abs_cl = sqrt(Ux_cl.^2 + vy_cl.^2);
+
+figure('Name','Velocidades — Modelo 3GDL');
+
+subplot(3,1,1)
+plot(t, Ux_nc, 'b', 'LineWidth', 1.5); hold on
+plot(t, Ux_cl, 'g', 'LineWidth', 1.5)
+ylabel('U_x [m/s]')
+legend('Sin control','Con control LQR+I')
+grid on
+title('Velocidad longitudinal')
+
+subplot(3,1,2)
+plot(t, vy_nc, 'b', 'LineWidth', 1.5); hold on
+plot(t, vy_cl, 'g', 'LineWidth', 1.5)
+yline(0,'k--','LineWidth',1)
+ylabel('v_y [m/s]')
+legend('Sin control','Con control LQR+I')
+grid on
+title('Velocidad lateral')
+
+subplot(3,1,3)
+plot(t, V_abs_nc, 'b', 'LineWidth', 1.5); hold on
+plot(t, V_abs_cl, 'g', 'LineWidth', 1.5)
+ylabel('|V| [m/s]')
+xlabel('Tiempo [s]')
+legend('Sin control','Con control LQR+I')
+grid on
+title('Velocidad absoluta  |V| = \surd(U_x^2 + v_y^2)')
